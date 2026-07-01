@@ -165,14 +165,14 @@ async function resolveDriveFileByPath(drive, driveFilePath) {
 /**
  * Uploads a local file into Drive and returns the created file metadata.
  */
-async function uploadFile(localFilePath, driveFolderPath = '', options = {}) {
+async function uploadFile(localFilePath, driveFolderPath = '', options = {}, driveClient = null) {
   if (!localFilePath) {
     throw new Error('Local file path is required.');
   }
 
   await fsp.access(localFilePath, fs.constants.R_OK);
 
-  const drive = await createDriveClient();
+  const drive = driveClient || await createDriveClient();
   const folderId = await resolveDriveFolderPath(drive, driveFolderPath, {createMissing: true});
   const fileName = options.fileName || path.basename(localFilePath);
   const mimeType = options.mimeType || 'application/octet-stream';
@@ -198,8 +198,8 @@ async function uploadFile(localFilePath, driveFolderPath = '', options = {}) {
  * Resolves a Drive file path, ensures it is shared with anyone who has the link,
  * and returns the best available share URL.
  */
-async function getShareLink(driveFilePath) {
-  const drive = await createDriveClient();
+async function getShareLink(driveFilePath, driveClient = null) {
+  const drive = driveClient || await createDriveClient();
   const file = await resolveDriveFileByPath(drive, driveFilePath);
 
   const existingPermissions = await drive.permissions.list({
@@ -237,11 +237,16 @@ async function getShareLink(driveFilePath) {
  * Public API exposed by this module for callers that need Drive upload or sharing helpers.
  */
 module.exports = {
+  // public API
   createDriveClient,
   getShareLink,
   resolveDriveFileByPath,
   resolveDriveFolderPath,
   uploadFile,
+  // helpers (exported for testing)
+  escapeDriveQueryValue,
+  normalizeDrivePath,
+  listMatchingDriveItems,
 };
 
 if (require.main === module) {
