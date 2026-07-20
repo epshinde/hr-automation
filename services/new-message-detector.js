@@ -23,8 +23,13 @@
  * reconnect handling.
  */
 
+const fs = require('node:fs/promises');
+const {simpleParser} = require('mailparser');
+const {createImapService} = require('./imap-service');
+
 const DEFAULT_INTERVAL_MS = 30000;
 const DEFAULT_MAILBOX = 'INBOX';
+const DEFAULT_STORE_PATH = '.listener-processed-uids.json';
 
 /**
  * Brief Summary: Find unseen messages whose UID is greater than a watermark.
@@ -243,13 +248,38 @@ function createNewMessageDetector({
  * Examples:
  * const msg = await fetchMessageContent(client, 'INBOX', 12345);
  */
-async function fetchMessageContent(_client, _mailbox, _uid) {
-  // TODO(KR 1.3): call client.mailboxOpen(mailbox, { readOnly: true }) if
-  // not already open, then client.fetchOne(uid, { source: true, ... })
-  // (or fetch a range that includes uid). Parse the parsed response into
-  // the { uid, sender, subject, bodyText, bodyHtml, attachments } shape
-  // documented in the JSDoc above. Attachment content must be returned as
-  // Buffer objects.
+async function fetchMessageContent(client, mailbox, uid) {
+  if (!client.mailbox || client.mailbox.path !== mailbox) {
+    await client.mailboxOpen(mailbox, {readOnly: true});
+  }
+
+  const message = await client.fetchOne(uid, {source: true, envelope: true}, {uid: true});
+  if (!message || !message.source) {
+    throw new Error(`No message found for uid=${uid} in mailbox "${mailbox}".`);
+  }
+
+  const parsed = await simpleParser(message.source);
+
+  const envelopeFrom = message.envelope && message.envelope.from && message.envelope.from[0];
+  const parsedFrom = parsed.from && parsed.from.value && parsed.from.value[0];
+  const sender = (envelopeFrom && envelopeFrom.address) || (parsedFrom && parsedFrom.address) || '';
+
+  const subject = (message.envelope && message.envelope.subject) || parsed.subject || '';
+
+  const attachments = (parsed.attachments || []).map((attachment) => ({
+    filename: attachment.filename || '',
+    mimeType: attachment.contentType || '',
+    content: attachment.content,
+  }));
+
+  return {
+    uid,
+    sender,
+    subject,
+    bodyText: parsed.text || '',
+    bodyHtml: parsed.html || '',
+    attachments,
+  };
 }
 
 /**
@@ -269,11 +299,20 @@ async function fetchMessageContent(_client, _mailbox, _uid) {
  * Examples:
  * const seen = await loadProcessedUids();
  */
-async function loadProcessedUids(_options = {}) {
-  // TODO(KR 1.4): read options.storePath (default
-  // '.listener-processed-uids.json') if it exists, JSON.parse it, and
-  // return the resulting array as a Set<number>. Return an empty set when
-  // the file is missing.
+async function loadProcessedUids(options = {}) {
+  const storePath = options.storePath || DEFAULT_STORE_PATH;
+
+  let raw;
+  try {
+    raw = await fs.readFile(storePath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return new Set();
+    }
+    throw err;
+  }
+
+  return new Set(JSON.parse(raw));
 }
 
 /**
@@ -295,12 +334,25 @@ async function loadProcessedUids(_options = {}) {
  * Examples:
  * await markProcessed(12345, { inMemory: seen });
  */
-async function markProcessed(uid, _options = {}) {
-  // TODO(KR 1.4): add uid to options.inMemory if provided, then merge
-  // the in-memory set into options.storePath (default
-  // '.listener-processed-uids.json') as a JSON array of numbers. Use an
-  // atomic write (write to .tmp then rename) so a crash mid-write cannot
-  // corrupt the store.
+async function markProcessed(uid, options = {}) {
+  const storePath = options.storePath || DEFAULT_STORE_PATH;
+  const inMemory = options.inMemory;
+
+  if (inMemory) {
+    inMemory.add(uid);
+  }
+
+  const persisted = await loadProcessedUids({storePath});
+  persisted.add(uid);
+  if (inMemory) {
+    for (const seenUid of inMemory) {
+      persisted.add(seenUid);
+    }
+  }
+
+  const tmpPath = `${storePath}.tmp`;
+  await fs.writeFile(tmpPath, JSON.stringify([...persisted].sort((a, b) => a - b)));
+  await fs.rename(tmpPath, storePath);
 }
 
 /**
@@ -308,29 +360,94 @@ async function markProcessed(uid, _options = {}) {
  * hand each new message's full content to a caller-supplied handler.
  *
  * Parameters (Arguments):
- * - handler (Function, required): Async (rawMessage) => void invoked once
- *   per new message. The handler should throw to signal a non-recoverable
- *   processing error; transient errors should be caught inside the handler.
- * - options (Object, optional): Forwarded to createNewMessageDetector +
- *   markProcessed.
+ * - handler (Function, required): Async (rawMessage) => void invoked once per
+ *   new, not-yet-processed message. The handler should throw to signal a
+ *   non-recoverable processing error; transient errors should be caught
+ *   inside the handler.
+ * - options (Object, optional):
+ *   - imapService (Object, optional): An object shaped like createImapService()'s
+ *     return value ({ connect, disconnect, getClient }). Defaults to a real
+ *     createImapService() instance; inject a fake for testing.
+ *   - mailbox (string, optional): Forwarded to createNewMessageDetector (default: 'INBOX').
+ *   - intervalMs (number, optional): Forwarded to createNewMessageDetector (default: 30000).
+ *   - storePath (string, optional): Forwarded to loadProcessedUids / markProcessed.
+ *   - signal (AbortSignal, optional): Aborting it stops the listener the same
+ *     way calling the returned controller's stop() would.
  *
- * Returns: Promise<void> - Resolves when options.signal is aborted.
+ * Returns: Promise<{ stop: () => Promise<void> }> - Resolves once connected and
+ * the detector is running. Call stop() to tear the listener down cleanly.
  *
  * Raises / Errors: Rejects on the initial connection failure. Per-message
- * handler errors are logged and the message is not marked as processed.
+ * handler (or fetch) errors are logged and the message is not marked as processed,
+ * so it is retried on the next detection pass.
  *
  * Examples:
- * await runListener(async (msg) => { await process(msg); });
+ * const listener = await runListener(async (msg) => { await process(msg); });
+ * // ... later ...
+ * await listener.stop();
  */
-async function runListener(handler, _options = {}) {
-  // TODO(KR 1.2, 1.3, 1.4): create an ImapService via createImapService(),
-  // connect, then drive createNewMessageDetector() with an onNewMessages
-  // callback that, per UID:
-  //   1. skips UIDs already in loadProcessedUids()
-  //   2. fetches the full content via fetchMessageContent()
-  //   3. await handler(rawMessage)
-  //   4. markProcessed(uid)
-  // Tear down on signal abort.
+async function runListener(handler, options = {}) {
+  if (typeof handler !== 'function') {
+    throw new Error('runListener requires a handler(rawMessage) function.');
+  }
+
+  const mailbox = options.mailbox || DEFAULT_MAILBOX;
+  const intervalMs = options.intervalMs || DEFAULT_INTERVAL_MS;
+  const storePath = options.storePath || DEFAULT_STORE_PATH;
+  const imapService = options.imapService || createImapService();
+
+  const processedUids = await loadProcessedUids({storePath});
+
+  await imapService.connect();
+
+  const detector = createNewMessageDetector({
+    getClient: () => imapService.getClient(),
+    mailbox,
+    intervalMs,
+    includeEnvelopes: false,
+    onNewMessages: async (messages) => {
+      const client = imapService.getClient();
+
+      for (const {uid} of messages) {
+        if (processedUids.has(uid)) {
+          continue;
+        }
+
+        try {
+          const raw = await fetchMessageContent(client, mailbox, uid);
+          await handler(raw);
+          await markProcessed(uid, {storePath, inMemory: processedUids});
+        } catch (err) {
+          console.error(
+            `[new-message-detector] runListener: failed to process uid=${uid}:`,
+            err && err.message ? err.message : err
+          );
+        }
+      }
+    },
+  });
+
+  await detector.start();
+
+  let stopped = false;
+  async function stop() {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    detector.stop();
+    await imapService.disconnect();
+  }
+
+  if (options.signal) {
+    if (options.signal.aborted) {
+      await stop();
+    } else {
+      options.signal.addEventListener('abort', () => { stop(); }, {once: true});
+    }
+  }
+
+  return {stop};
 }
 
 module.exports = {
