@@ -1,7 +1,9 @@
 /**
  * new-message-detector.js
  *
- * Detects newly arrived unread messages in an already-open IMAP mailbox.
+ * Detects newly arrived unread messages in an already-open IMAP mailbox, fetches
+ * their full content, and dedups/hands them off to a caller-supplied handler
+ * (KR 1.2, 1.3, 1.4).
  *
  * Design (Sprint 33 KR "New-Message Detection Loop"):
  * - `findNewUnreadMessages` is the isolated, unit-testable detection core: given a
@@ -10,6 +12,11 @@
  * - `createNewMessageDetector` is the loop that drives it in a **hybrid** fashion:
  *   imapflow's IDLE `exists` event triggers an immediate check for near-instant
  *   detection, and a polling interval acts as a safety net.
+ * - `fetchMessageContent` fetches the full content (body, attachments) of a single
+ *   detected message.
+ * - `loadProcessedUids` / `markProcessed` persist a dedup set across restarts.
+ * - `runListener` is the top-level glue: connect, drive the detector, fetch each
+ *   new message, and hand it to a caller-supplied handler.
  *
  * It consumes the connected client from services/imap-service.js (via a getClient
  * callback) rather than owning its own connection, so it inherits that service's
@@ -212,9 +219,127 @@ function createNewMessageDetector({
   return {start, stop, check};
 }
 
+/**
+ * Brief Summary: Fetch the full content of a single message by UID and return
+ * a structured raw-message object.
+ *
+ * Parameters (Arguments):
+ * - client (ImapFlow-like, required): A connected IMAP client.
+ * - mailbox (string, required): Mailbox the message lives in.
+ * - uid (number, required): UID of the message to fetch.
+ *
+ * Returns: Promise<{
+ *   uid: number,
+ *   sender: string,
+ *   subject: string,
+ *   bodyText: string,
+ *   bodyHtml: string,
+ *   attachments: Array<{ filename: string, mimeType: string, content: Buffer }>,
+ * }>
+ *
+ * Raises / Errors: Rejects with an Error if the fetch call fails or the
+ * server response is missing required fields.
+ *
+ * Examples:
+ * const msg = await fetchMessageContent(client, 'INBOX', 12345);
+ */
+async function fetchMessageContent(_client, _mailbox, _uid) {
+  // TODO(KR 1.3): call client.mailboxOpen(mailbox, { readOnly: true }) if
+  // not already open, then client.fetchOne(uid, { source: true, ... })
+  // (or fetch a range that includes uid). Parse the parsed response into
+  // the { uid, sender, subject, bodyText, bodyHtml, attachments } shape
+  // documented in the JSDoc above. Attachment content must be returned as
+  // Buffer objects.
+}
+
+/**
+ * Brief Summary: Load the set of UIDs that have already been processed in
+ * this run or in previous runs.
+ *
+ * Parameters (Arguments):
+ * - options (Object, optional):
+ *   - storePath (string, optional): Path to a JSON file used to persist UIDs
+ *     across restarts (default: '.listener-processed-uids.json').
+ *
+ * Returns: Promise<Set<number>> - The set of UIDs considered already processed.
+ *
+ * Raises / Errors: Rejects with an Error if the persistence file exists but
+ * cannot be read or parsed.
+ *
+ * Examples:
+ * const seen = await loadProcessedUids();
+ */
+async function loadProcessedUids(_options = {}) {
+  // TODO(KR 1.4): read options.storePath (default
+  // '.listener-processed-uids.json') if it exists, JSON.parse it, and
+  // return the resulting array as a Set<number>. Return an empty set when
+  // the file is missing.
+}
+
+/**
+ * Brief Summary: Persist a UID as processed so it is not re-fired on the
+ * next poll cycle.
+ *
+ * Parameters (Arguments):
+ * - uid (number, required): UID that was just handed off downstream.
+ * - options (Object, optional):
+ *   - storePath (string, optional): Path to a JSON file used to persist UIDs
+ *     (default: '.listener-processed-uids.json').
+ *   - inMemory (Set<number>, optional): The in-memory set returned by
+ *     loadProcessedUids(). Mutated in place for fast dedup checks.
+ *
+ * Returns: Promise<void>
+ *
+ * Raises / Errors: Rejects with an Error if writing to the store fails.
+ *
+ * Examples:
+ * await markProcessed(12345, { inMemory: seen });
+ */
+async function markProcessed(uid, _options = {}) {
+  // TODO(KR 1.4): add uid to options.inMemory if provided, then merge
+  // the in-memory set into options.storePath (default
+  // '.listener-processed-uids.json') as a JSON array of numbers. Use an
+  // atomic write (write to .tmp then rename) so a crash mid-write cannot
+  // corrupt the store.
+}
+
+/**
+ * Brief Summary: Top-level glue — connect, run the hybrid detection loop, and
+ * hand each new message's full content to a caller-supplied handler.
+ *
+ * Parameters (Arguments):
+ * - handler (Function, required): Async (rawMessage) => void invoked once
+ *   per new message. The handler should throw to signal a non-recoverable
+ *   processing error; transient errors should be caught inside the handler.
+ * - options (Object, optional): Forwarded to createNewMessageDetector +
+ *   markProcessed.
+ *
+ * Returns: Promise<void> - Resolves when options.signal is aborted.
+ *
+ * Raises / Errors: Rejects on the initial connection failure. Per-message
+ * handler errors are logged and the message is not marked as processed.
+ *
+ * Examples:
+ * await runListener(async (msg) => { await process(msg); });
+ */
+async function runListener(handler, _options = {}) {
+  // TODO(KR 1.2, 1.3, 1.4): create an ImapService via createImapService(),
+  // connect, then drive createNewMessageDetector() with an onNewMessages
+  // callback that, per UID:
+  //   1. skips UIDs already in loadProcessedUids()
+  //   2. fetches the full content via fetchMessageContent()
+  //   3. await handler(rawMessage)
+  //   4. markProcessed(uid)
+  // Tear down on signal abort.
+}
+
 module.exports = {
   // public API
   createNewMessageDetector,
+  runListener,
+  fetchMessageContent,
+  loadProcessedUids,
+  markProcessed,
   // helpers (exported for testing)
   findNewUnreadMessages,
   fetchEnvelopes,
